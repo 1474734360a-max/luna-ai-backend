@@ -569,6 +569,27 @@ async def generate_voice(text: str, character_name: str) -> bytes | None:
         logger.error(f"Voice gen error: {e}")
         return None
 
+# Background: heavy chat processing after webhook returns immediately
+async def process_and_reply(tg_id: int, character_id: int, text: str):
+    db = SessionLocal()
+    try:
+        user = db.query(UserDB).filter(UserDB.tg_id == tg_id).first()
+        character = db.query(CharacterDB).filter(CharacterDB.id == character_id).first()
+        result = await process_user_message(tg_id, character_id, text, db)
+        if "error" in result:
+            await send_telegram_message(tg_id, f"⚠️ {result['error']}")
+            return
+        reply = result["reply"]["content"]
+        await send_telegram_message(tg_id, reply)
+        if user and user.voice_enabled and character:
+            audio = await generate_voice(reply, character.name)
+            if audio:
+                await send_telegram_voice(tg_id, audio)
+    except Exception as e:
+        logger.error(f"background reply error: {e}")
+    finally:
+        db.close()
+
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
     """Handle incoming Telegram messages (raw dict parsing - avoids pydantic 'from' alias issues)"""
@@ -722,23 +743,10 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
         # Use the character the user last chatted with, default Veronika
         last_chat = db.query(ChatDB).filter(ChatDB.tg_id == tg_id).order_by(ChatDB.created_at.desc()).first()
         character_id = last_chat.character_id if last_chat else 1
-        character = db.query(CharacterDB).filter(CharacterDB.id == character_id).first()
 
-        result = await process_user_message(tg_id, character_id, text, db)
-
-        if "error" in result:
-            reply = f"⚠️ {result['error']}"
-            await send_telegram_message(tg_id, reply)
-            return {"ok": True}
-        
-        reply = result["reply"]["content"]
-        await send_telegram_message(tg_id, reply)
-
-        # Voice reply if enabled
-        if user.voice_enabled and character:
-            audio = await generate_voice(reply, character.name)
-            if audio:
-                await send_telegram_voice(tg_id, audio)
+        # Process in background so the webhook returns 200 immediately (avoids Telegram 502 on slow AI/voice)
+        import asyncio
+        asyncio.create_task(process_and_reply(tg_id, character_id, text))
 
         return {"ok": True}
 
