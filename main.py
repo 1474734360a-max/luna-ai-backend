@@ -258,16 +258,38 @@ async def call_deepseek(messages: list, deepseek_key: str) -> str:
                     "model": "deepseek-v4-flash",
                     "messages": messages,
                     "temperature": 0.8,
-                    "max_tokens": 300
+                    "max_tokens": 800
                 }
             )
             
             if response.status_code == 200:
                 data = response.json()
-                return data["choices"][0]["message"]["content"]
+                msg = data["choices"][0]["message"]
+                content = (msg.get("content") or "").strip()
+                if not content and msg.get("reasoning_content"):
+                    # reasoning model spent all tokens thinking - retry once with a nudge
+                    logger.warning("Empty content (reasoning consumed tokens), retrying")
+                    retry = await client.post(
+                        "https://api.deepseek.com/chat/completions",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {deepseek_key}"
+                        },
+                        json={
+                            "model": "deepseek-v4-flash",
+                            "messages": messages + [{"role": "user", "content": "(请直接用一两句话回答，不要思考过程)"}],
+                            "temperature": 0.8,
+                            "max_tokens": 800
+                        }
+                    )
+                    if retry.status_code == 200:
+                        content = (retry.json()["choices"][0]["message"].get("content") or "").strip()
+                if not content:
+                    logger.error(f"DeepSeek returned empty content twice: {json.dumps(data)[:200]}")
+                return content or ""
             else:
                 logger.error(f"DeepSeek error: {response.status_code} {response.text}")
-                return "Sorry, I'm distracted right now. Try again?"
+                return ""
     except Exception as e:
         logger.error(f"DeepSeek call error: {e}")
         return "Hmm, I had a moment there... say that again?"
@@ -512,11 +534,13 @@ async def send_telegram_photo(chat_id: int, photo_bytes: bytes, caption: str = "
 
 async def send_telegram_voice(chat_id: int, voice_bytes: bytes):
     async with httpx.AsyncClient(timeout=90.0) as client:
-        await client.post(
+        r = await client.post(
             f"{TELEGRAM_API_URL}/sendVoice",
             data={"chat_id": str(chat_id)},
             files={"voice": ("voice.mp3", voice_bytes, "audio/mpeg")}
         )
+        if r.status_code != 200:
+            logger.error(f"sendVoice FAILED {r.status_code} to {chat_id}: {r.text[:200]}")
 
 # ===== Image generation (Pollinations/Flux, free; swap to Replicate later) =====
 async def generate_image(prompt: str) -> bytes | None:
@@ -555,6 +579,7 @@ def detect_reply_language(text: str) -> str:
 
 async def generate_voice(text: str, character_name: str) -> bytes | None:
     try:
+        import asyncio
         import edge_tts
         lang = detect_reply_language(text)
         key = character_name.lower()
@@ -562,12 +587,20 @@ async def generate_voice(text: str, character_name: str) -> bytes | None:
             voice, rate, pitch = EDGE_VOICES[lang][key]
         else:
             voice = VOICE_FALLBACK.get(lang, "en-US-AvaNeural"); rate, pitch = "+2%", "+0Hz"
-        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-        chunks = []
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                chunks.append(chunk["data"])
-        return b"".join(chunks) if chunks else None
+
+        async def _synth():
+            communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+            chunks = []
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    chunks.append(chunk["data"])
+            return b"".join(chunks) if chunks else None
+
+        # hard 30s cap so a stuck TTS connection can never hang the bot
+        return await asyncio.wait_for(_synth(), timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.error("Voice gen timed out after 30s")
+        return None
     except Exception as e:
         logger.error(f"Voice gen error: {e}")
         return None
@@ -583,6 +616,8 @@ async def process_and_reply(tg_id: int, character_id: int, text: str):
             await send_telegram_message(tg_id, f"⚠️ {result['error']}")
             return
         reply = result["reply"]["content"]
+        if not reply.strip():
+            reply = "*她眨了眨眼，好像走神了* ……嗯？你刚才说什么？再说一遍好不好？"
         await send_telegram_message(tg_id, reply)
         if user and user.voice_enabled and character:
             audio = await generate_voice(reply, character.name)
