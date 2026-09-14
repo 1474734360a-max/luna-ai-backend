@@ -382,6 +382,7 @@ async def login(payload: UserLogin, db: Session = Depends(get_db)):
         if payload.language:
             user.language = payload.language
             db.commit()
+    mark_vip(user, payload.username, db)
     
     return {
         "access_token": str(user.tg_id),
@@ -462,6 +463,22 @@ async def send_telegram_message(chat_id: int, text: str):
         )
 
 PLUS_PRICE_STARS = 150  # ~¥15/month
+
+# VIP 白名单: 这些用户免订阅直接享受 Plus 待遇 (永久)
+VIP_USERNAMES = {"wengui26"}
+try:
+    VIP_USERNAMES |= {u.strip().lstrip("@").lower() for u in os.getenv("VIP_USERS", "").split(",") if u.strip()}
+except Exception:
+    pass
+
+def mark_vip(user, username: str | None, db) -> bool:
+    """If the user is on the VIP list, grant permanent Plus. Returns True if VIP."""
+    if username and username.lower() in VIP_USERNAMES and not is_plus(user):
+        user.plus_expires_at = datetime(2099, 1, 1)
+        db.commit()
+        logger.info(f"VIP access granted to @{username} (tg {user.tg_id})")
+        return True
+    return False
 
 def is_plus(user) -> bool:
     return bool(user.plus_expires_at and user.plus_expires_at > datetime.utcnow())
@@ -590,6 +607,7 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
             user = UserDB(tg_id=tg_id, username=username, first_name=frm.get("first_name"), language="zh")
             db.add(user)
             db.commit()
+        mark_vip(user, username, db)
 
         # Handle /start command
         if text.startswith("/start"):
