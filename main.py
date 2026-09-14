@@ -364,6 +364,15 @@ async def health():
         "env_count": len(_os.environ),
     }
 
+@app.get("/tgtest")
+async def tgtest():
+    """TEMP debug: send a real message and return Telegram's raw response"""
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{TELEGRAM_API_URL}/sendMessage",
+                         json={"chat_id": 2023780638, "text": "backend debug test"})
+        return {"status": r.status_code, "body": r.text[:400],
+                "token_prefix": (TELEGRAM_BOT_TOKEN or "NONE")[:12]}
+
 @app.post("/auth/login")
 async def login(payload: UserLogin, db: Session = Depends(get_db)):
     """Telegram user login"""
