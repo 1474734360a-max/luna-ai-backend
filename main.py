@@ -466,10 +466,13 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 async def send_telegram_message(chat_id: int, text: str):
     """Send message back to Telegram user"""
     async with httpx.AsyncClient() as client:
-        await client.post(
+        r = await client.post(
             f"{TELEGRAM_API_URL}/sendMessage",
             json={"chat_id": chat_id, "text": text}
         )
+        if r.status_code != 200:
+            logger.error(f"sendMessage FAILED {r.status_code} to {chat_id}: {r.text[:300]} | text[:80]={repr(text[:80])}")
+        return r
 
 PLUS_PRICE_STARS = 150  # ~¥15/month
 
