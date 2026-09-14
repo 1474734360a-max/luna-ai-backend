@@ -336,7 +336,14 @@ async def process_user_message(tg_id: int, character_id: int, content: str, db: 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    import os as _os
+    return {
+        "status": "ok",
+        "has_deepseek_key": bool(_os.getenv("DEEPSEEK_API_KEY")),
+        "has_telegram_token": bool(_os.getenv("TELEGRAM_BOT_TOKEN")),
+        "database_url": (_os.getenv("DATABASE_URL") or "")[:20],
+        "env_count": len(_os.environ),
+    }
 
 @app.post("/auth/login")
 async def login(payload: UserLogin, db: Session = Depends(get_db)):
