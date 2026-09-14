@@ -50,6 +50,10 @@ class UserDB(Base):
     language = Column(String(10), default="zh")
     daily_messages_used = Column(Integer, default=0)
     daily_reset_at = Column(DateTime, default=datetime.utcnow)
+    voice_enabled = Column(Boolean, default=False)
+    plus_expires_at = Column(DateTime, nullable=True)
+    images_used_today = Column(Integer, default=0)
+    images_reset_at = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class CharacterDB(Base):
@@ -139,6 +143,21 @@ class TelegramUpdate(BaseModel):
 # ===== Database Setup =====
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # migrate old SQLite databases (columns added after first release)
+    if "sqlite" in DATABASE_URL:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE users ADD COLUMN voice_enabled BOOLEAN DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN plus_expires_at DATETIME",
+                "ALTER TABLE users ADD COLUMN images_used_today INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN images_reset_at DATETIME",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                    conn.commit()
+                except Exception:
+                    pass  # column already exists
     # Seed characters if empty
     session = SessionLocal()
     if session.query(CharacterDB).count() == 0:
@@ -268,15 +287,15 @@ async def process_user_message(tg_id: int, character_id: int, content: str, db: 
         db.commit()
         db.refresh(user)
     
-    # Check daily limit
+    # Check daily limit (Plus members unlimited)
     now = datetime.utcnow()
     if now - user.daily_reset_at > timedelta(days=1):
         user.daily_messages_used = 0
         user.daily_reset_at = now
         db.commit()
     
-    if user.daily_messages_used >= 3:
-        return {"error": "Daily limit reached", "remaining": 0}
+    if not is_plus(user) and user.daily_messages_used >= 3:
+        return {"error": "Daily limit reached (3/day free). /plus to unlock unlimited!", "remaining": 0}
     
     # Get or create chat
     chat = db.query(ChatDB).filter(
@@ -442,14 +461,121 @@ async def send_telegram_message(chat_id: int, text: str):
             json={"chat_id": chat_id, "text": text}
         )
 
+PLUS_PRICE_STARS = 150  # ~¥15/month
+
+def is_plus(user) -> bool:
+    return bool(user.plus_expires_at and user.plus_expires_at > datetime.utcnow())
+
+def reset_image_quota_if_needed(user, db):
+    now = datetime.utcnow()
+    if now - (user.images_reset_at or now) > timedelta(days=1):
+        user.images_used_today = 0
+        user.images_reset_at = now
+        db.commit()
+
+async def send_telegram_photo(chat_id: int, photo_bytes: bytes, caption: str = ""):
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        await client.post(
+            f"{TELEGRAM_API_URL}/sendPhoto",
+            data={"chat_id": str(chat_id), "caption": caption[:1000]},
+            files={"photo": ("image.jpg", photo_bytes, "image/jpeg")}
+        )
+
+async def send_telegram_voice(chat_id: int, voice_bytes: bytes):
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        await client.post(
+            f"{TELEGRAM_API_URL}/sendVoice",
+            data={"chat_id": str(chat_id)},
+            files={"voice": ("voice.mp3", voice_bytes, "audio/mpeg")}
+        )
+
+# ===== Image generation (Pollinations/Flux, free; swap to Replicate later) =====
+async def generate_image(prompt: str) -> bytes | None:
+    try:
+        import urllib.parse
+        url = "https://image.pollinations.ai/prompt/" + urllib.parse.quote(
+            f"photorealistic portrait, {prompt}, detailed, soft lighting", safe="")
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.get(url, params={"width": 768, "height": 1024, "nologo": "true"})
+            if r.status_code == 200 and len(r.content) > 5000:
+                return r.content
+            logger.error(f"Image gen failed: {r.status_code} len={len(r.content)}")
+            return None
+    except Exception as e:
+        logger.error(f"Image gen error: {e}")
+        return None
+
+# ===== Voice synthesis (Edge TTS, free) =====
+EDGE_VOICES = {
+    "zh": {"veronika": ("zh-CN-XiaoyiNeural", "+10%", "+2Hz"),
+           "karina":   ("zh-CN-XiaoxiaoNeural", "-8%", "-4Hz"),
+           "alina":    ("zh-CN-XiaoxiaoNeural", "+2%", "+1Hz"),
+           "katya":    ("zh-CN-XiaoyiNeural", "+6%", "+6Hz")},
+    "en": {"veronika": ("en-US-AnaNeural", "+8%", "+2Hz"),
+           "karina":   ("en-US-AriaNeural", "-6%", "-4Hz"),
+           "alina":    ("en-US-JennyNeural", "+2%", "+0Hz"),
+           "katya":    ("en-US-AvaNeural", "+5%", "+6Hz")},
+}
+VOICE_FALLBACK = {"ja": "ja-JP-NanamiNeural", "ko": "ko-KR-SunHiNeural"}
+
+def detect_reply_language(text: str) -> str:
+    if any('\u3040' <= c <= '\u30ff' for c in text): return "ja"
+    if any('\uac00' <= c <= '\ud7af' for c in text): return "ko"
+    if any('\u4e00' <= c <= '\u9fff' for c in text): return "zh"
+    return "en"
+
+async def generate_voice(text: str, character_name: str) -> bytes | None:
+    try:
+        import edge_tts
+        lang = detect_reply_language(text)
+        key = character_name.lower()
+        if lang in EDGE_VOICES and key in EDGE_VOICES[lang]:
+            voice, rate, pitch = EDGE_VOICES[lang][key]
+        else:
+            voice = VOICE_FALLBACK.get(lang, "en-US-AvaNeural"); rate, pitch = "+2%", "+0Hz"
+        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        chunks = []
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                chunks.append(chunk["data"])
+        return b"".join(chunks) if chunks else None
+    except Exception as e:
+        logger.error(f"Voice gen error: {e}")
+        return None
+
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
     """Handle incoming Telegram messages (raw dict parsing - avoids pydantic 'from' alias issues)"""
     try:
         data = await request.json()
+
+        # ---- Telegram Stars payment: pre-checkout ----
+        pcq = data.get("pre_checkout_query")
+        if pcq:
+            async with httpx.AsyncClient() as client:
+                await client.post(f"{TELEGRAM_API_URL}/answerPreCheckoutQuery",
+                                  json={"pre_checkout_query_id": pcq["id"], "ok": True})
+            return {"ok": True}
+
         msg = data.get("message") or {}
         frm = msg.get("from") or {}
         tg_id = frm.get("id")
+
+        # ---- Successful payment → activate Plus ----
+        sp = msg.get("successful_payment")
+        if tg_id and sp:
+            user = db.query(UserDB).filter(UserDB.tg_id == tg_id).first()
+            if not user:
+                user = UserDB(tg_id=tg_id, username=frm.get("username"),
+                              first_name=frm.get("first_name"), language="zh")
+                db.add(user)
+            base = user.plus_expires_at if (user.plus_expires_at and user.plus_expires_at > datetime.utcnow()) else datetime.utcnow()
+            user.plus_expires_at = base + timedelta(days=30)
+            db.commit()
+            logger.info(f"Plus activated for {tg_id}: {user.plus_expires_at}")
+            await send_telegram_message(tg_id, "👑 Luna Plus 已开通（30 天）！\n\n✅ 无限聊天\n✅ 无限图片生成\n✅ 语音回复\n\n祝你玩得开心~")
+            return {"ok": True}
+
         text = msg.get("text")
         username = frm.get("username")
 
@@ -467,21 +593,96 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
 
         # Handle /start command
         if text.startswith("/start"):
-            welcome = ("🧚‍♀️ Welcome to Luna AI!\n\n"
-                       "Choose a character to chat with:\n"
-                       "1. /veronika\n2. /karina\n3. /alina\n4. /katya\n\n"
-                       "Then just send any message and she will reply 💬")
-            await send_telegram_message(tg_id, welcome)
+            await send_telegram_message(tg_id,
+                "🧚‍♀️ Welcome to Luna AI!\n\n"
+                "Choose a character to chat with:\n"
+                "1. /veronika\n2. /karina\n3. /alina\n4. /katya\n\n"
+                "📸 /imagine <描述> — generate a photo\n"
+                "🎙 /voice — toggle voice replies\n"
+                "👑 /plus — unlock unlimited (Stars)\n"
+                "ℹ️ /status — your usage\n\n"
+                "Then just send any message and she will reply 💬")
+            return {"ok": True}
+
+        # /help
+        if text.startswith("/help"):
+            await send_telegram_message(tg_id,
+                "📖 Luna AI 命令:\n\n"
+                "/veronika /karina /alina /katya — 选择角色\n"
+                "/imagine <描述> — 生成照片 (免费3张/天)\n"
+                "/voice — 开关语音回复\n"
+                "/status — 查看额度\n"
+                "/plus — 开通 Plus (150 Stars/月)\n\n"
+                "免费版: 3条消息+3张图/天 | Plus: 无限")
+            return {"ok": True}
+
+        # /status
+        if text.startswith("/status"):
+            reset_image_quota_if_needed(user, db)
+            now = datetime.utcnow()
+            if now - user.daily_reset_at > timedelta(days=1):
+                user.daily_messages_used = 0; user.daily_reset_at = now; db.commit()
+            plus = is_plus(user)
+            await send_telegram_message(tg_id,
+                f"📊 你的状态\n\n"
+                f"👑 Plus: {'✅ 至 ' + user.plus_expires_at.strftime('%Y-%m-%d') if plus else '未开通'}\n"
+                f"💬 今日消息: {user.daily_messages_used}/{'∞' if plus else '3'}\n"
+                f"📸 今日图片: {user.images_used_today}/{'∞' if plus else '3'}\n"
+                f"🎙 语音回复: {'开' if user.voice_enabled else '关'}")
+            return {"ok": True}
+
+        # /voice toggle
+        if text.startswith("/voice"):
+            user.voice_enabled = not user.voice_enabled
+            db.commit()
+            await send_telegram_message(tg_id,
+                f"🎙 语音回复已{'开启，她的每条回复都会附带语音' if user.voice_enabled else '关闭'}")
+            return {"ok": True}
+
+        # /plus
+        if text.startswith("/plus"):
+            if is_plus(user):
+                await send_telegram_message(tg_id, f"👑 你已经是 Plus（至 {user.plus_expires_at.strftime('%Y-%m-%d')}）")
+                return {"ok": True}
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(f"{TELEGRAM_API_URL}/sendInvoice", json={
+                    "chat_id": tg_id,
+                    "title": "Luna Plus (30 days)",
+                    "description": "无限聊天 + 无限图片生成 + 语音回复",
+                    "payload": "plus_30d",
+                    "currency": "XTR",
+                    "prices": [{"label": "Luna Plus", "amount": PLUS_PRICE_STARS}]
+                })
+                logger.info(f"sendInvoice: {r.status_code} {r.text[:120]}")
+            return {"ok": True}
+
+        # /imagine <prompt>
+        if text.startswith("/imagine"):
+            prompt = text.replace("/imagine", "").strip()
+            if not prompt:
+                await send_telegram_message(tg_id, "用法: /imagine 一个红裙子的女孩在咖啡馆\n(或: /imagine a girl in red dress)")
+                return {"ok": True}
+            reset_image_quota_if_needed(user, db)
+            if not is_plus(user) and user.images_used_today >= 3:
+                await send_telegram_message(tg_id, "📸 今日 3 张免费图片已用完。\n👑 /plus 解锁无限生成")
+                return {"ok": True}
+            await send_telegram_message(tg_id, "🎨 正在生成，请等 10-30 秒...")
+            img = await generate_image(prompt)
+            if img:
+                user.images_used_today += 1
+                db.commit()
+                await send_telegram_photo(tg_id, img, caption=f"🎨 {prompt[:200]}")
+            else:
+                await send_telegram_message(tg_id, "😔 生成失败了，换一个描述试试？")
             return {"ok": True}
 
         # Handle character selection commands
-        character_map = {"/veronika": 1, "/karina": 2, "/alina": 3, "/katya": 4}
-
-        if text in character_map:
-            character_id = character_map[text]
+        character_map = {"veronika": 1, "karina": 2, "alina": 3, "katya": 4}
+        cmd = text.lstrip("/").split("@")[0].lower()
+        if cmd in character_map:
+            character_id = character_map[cmd]
             character = db.query(CharacterDB).filter(CharacterDB.id == character_id).first()
             if character:
-                # Remember the user's current character via a chat row (latest chat = active)
                 chat = db.query(ChatDB).filter(
                     ChatDB.tg_id == tg_id, ChatDB.character_id == character_id).first()
                 if not chat:
@@ -494,15 +695,24 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
         # Use the character the user last chatted with, default Veronika
         last_chat = db.query(ChatDB).filter(ChatDB.tg_id == tg_id).order_by(ChatDB.created_at.desc()).first()
         character_id = last_chat.character_id if last_chat else 1
+        character = db.query(CharacterDB).filter(CharacterDB.id == character_id).first()
 
         result = await process_user_message(tg_id, character_id, text, db)
 
         if "error" in result:
             reply = f"⚠️ {result['error']}"
-        else:
-            reply = result["reply"]["content"]
-
+            await send_telegram_message(tg_id, reply)
+            return {"ok": True}
+        
+        reply = result["reply"]["content"]
         await send_telegram_message(tg_id, reply)
+
+        # Voice reply if enabled
+        if user.voice_enabled and character:
+            audio = await generate_voice(reply, character.name)
+            if audio:
+                await send_telegram_voice(tg_id, audio)
+
         return {"ok": True}
 
     except Exception as e:
