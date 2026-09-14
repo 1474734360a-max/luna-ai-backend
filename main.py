@@ -1,10 +1,11 @@
 """
 Luna AI Clone - FastAPI Backend
-MVP: User authentication + Chat + Character management
+MVP: User authentication + Chat + Character management + Telegram Bot
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -13,6 +14,10 @@ import os
 from datetime import datetime, timedelta
 import httpx
 import json
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ===== Database Setup =====
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
@@ -111,6 +116,26 @@ class ChatResponse(BaseModel):
     reply: MessageResponse
     remaining_today: int
 
+# ===== Telegram Update Schema =====
+class TelegramUser(BaseModel):
+    id: int
+    is_bot: bool = False
+    first_name: str
+    username: Optional[str] = None
+    language_code: Optional[str] = None
+
+class TelegramMessage(BaseModel):
+    message_id: int
+    from_user: TelegramUser = None
+    text: Optional[str] = None
+    
+    class Config:
+        fields = {"from_user": {"alias": "from"}}
+
+class TelegramUpdate(BaseModel):
+    update_id: int
+    message: Optional[TelegramMessage] = None
+
 # ===== Database Setup =====
 def init_db():
     Base.metadata.create_all(bind=engine)
@@ -159,10 +184,10 @@ def init_db():
 async def lifespan(app: FastAPI):
     # Startup
     init_db()
-    print("✅ Database initialized")
+    logger.info("✅ Database initialized")
     yield
     # Shutdown
-    print("👋 Shutting down")
+    logger.info("👋 Shutting down")
 
 # ===== FastAPI App =====
 app = FastAPI(title="Luna AI Backend", version="0.1.0", lifespan=lifespan)
@@ -199,7 +224,116 @@ def get_current_user(authorization: str = Header(None), db: Session = Depends(ge
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
-# ===== Routes =====
+# ===== Helper: Call DeepSeek API =====
+async def call_deepseek(messages: list, deepseek_key: str) -> str:
+    """Call DeepSeek API and return response text"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.deepseek.com/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {deepseek_key}"
+                },
+                json={
+                    "model": "deepseek-v4-flash",
+                    "messages": messages,
+                    "temperature": 0.8,
+                    "max_tokens": 300
+                }
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            else:
+                logger.error(f"DeepSeek error: {response.status_code} {response.text}")
+                return "Sorry, I'm distracted right now. Try again?"
+    except Exception as e:
+        logger.error(f"DeepSeek call error: {e}")
+        return "Hmm, I had a moment there... say that again?"
+
+# ===== Helper: Process User Message =====
+async def process_user_message(tg_id: int, character_id: int, content: str, db: Session) -> dict:
+    """
+    Process a user message and return AI response
+    Used by both API and Telegram webhook
+    """
+    
+    # Get or create user
+    user = db.query(UserDB).filter(UserDB.tg_id == tg_id).first()
+    if not user:
+        user = UserDB(tg_id=tg_id, language="zh")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    
+    # Check daily limit
+    now = datetime.utcnow()
+    if now - user.daily_reset_at > timedelta(days=1):
+        user.daily_messages_used = 0
+        user.daily_reset_at = now
+        db.commit()
+    
+    if user.daily_messages_used >= 3:
+        return {"error": "Daily limit reached", "remaining": 0}
+    
+    # Get or create chat
+    chat = db.query(ChatDB).filter(
+        ChatDB.tg_id == tg_id,
+        ChatDB.character_id == character_id
+    ).first()
+    
+    if not chat:
+        chat = ChatDB(tg_id=tg_id, character_id=character_id)
+        db.add(chat)
+        db.commit()
+        db.refresh(chat)
+    
+    # Save user message
+    user_msg = MessageDB(chat_id=chat.id, role="user", content=content)
+    db.add(user_msg)
+    db.commit()
+    db.refresh(user_msg)
+    
+    # Get character
+    character = db.query(CharacterDB).filter(CharacterDB.id == character_id).first()
+    if not character:
+        return {"error": "Character not found"}
+    
+    # Get recent chat history
+    history = db.query(MessageDB).filter(MessageDB.chat_id == chat.id).order_by(MessageDB.created_at).all()
+    
+    # Build messages for DeepSeek
+    messages = [{"role": "system", "content": character.system_prompt}]
+    for msg in history[-10:]:  # Last 10 messages
+        messages.append({"role": msg.role, "content": msg.content})
+    
+    # Call DeepSeek API
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    ai_response_text = await call_deepseek(messages, deepseek_key)
+    
+    # Save AI response
+    ai_msg = MessageDB(chat_id=chat.id, role="assistant", content=ai_response_text)
+    db.add(ai_msg)
+    db.commit()
+    db.refresh(ai_msg)
+    
+    # Update daily counter and relationship level
+    user.daily_messages_used += 1
+    chat.relationship_level = min(100, chat.relationship_level + 2)
+    db.commit()
+    
+    remaining = max(0, 3 - user.daily_messages_used)
+    
+    return {
+        "message": {"id": user_msg.id, "role": user_msg.role, "content": user_msg.content},
+        "reply": {"id": ai_msg.id, "role": ai_msg.role, "content": ai_msg.content},
+        "remaining_today": remaining
+    }
+
+# ===== REST API Routes =====
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -209,7 +343,6 @@ async def login(payload: UserLogin, db: Session = Depends(get_db)):
     """Telegram user login"""
     user = db.query(UserDB).filter(UserDB.tg_id == payload.tg_id).first()
     if not user:
-        # Create new user
         user = UserDB(
             tg_id=payload.tg_id,
             username=payload.username,
@@ -220,12 +353,10 @@ async def login(payload: UserLogin, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(user)
     else:
-        # Update language if provided
         if payload.language:
             user.language = payload.language
             db.commit()
     
-    # Return "token" (actually just tg_id as Bearer token for MVP)
     return {
         "access_token": str(user.tg_id),
         "token_type": "bearer",
@@ -258,7 +389,6 @@ async def get_profile(
     db: Session = Depends(get_db)
 ):
     """Get user profile and daily remaining messages"""
-    # Reset daily counter if needed
     now = datetime.utcnow()
     if now - current_user.daily_reset_at > timedelta(days=1):
         current_user.daily_messages_used = 0
@@ -280,106 +410,102 @@ async def send_message(
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Send message and get AI response"""
+    """Send message and get AI response (API endpoint)"""
+    result = await process_user_message(current_user.tg_id, character_id, payload.content, db)
     
-    # Check daily limit
-    now = datetime.utcnow()
-    if now - current_user.daily_reset_at > timedelta(days=1):
-        current_user.daily_messages_used = 0
-        current_user.daily_reset_at = now
-        db.commit()
-    
-    if current_user.daily_messages_used >= 3:
-        raise HTTPException(status_code=429, detail="Daily limit reached")
-    
-    # Get or create chat
-    chat = db.query(ChatDB).filter(
-        ChatDB.tg_id == current_user.tg_id,
-        ChatDB.character_id == character_id
-    ).first()
-    
-    if not chat:
-        chat = ChatDB(tg_id=current_user.tg_id, character_id=character_id)
-        db.add(chat)
-        db.commit()
-        db.refresh(chat)
-    
-    # Save user message
-    user_msg = MessageDB(chat_id=chat.id, role="user", content=payload.content)
-    db.add(user_msg)
-    db.commit()
-    db.refresh(user_msg)
-    
-    # Get character
-    character = db.query(CharacterDB).filter(CharacterDB.id == character_id).first()
-    if not character:
-        raise HTTPException(status_code=404, detail="Character not found")
-    
-    # Get recent chat history
-    history = db.query(MessageDB).filter(MessageDB.chat_id == chat.id).order_by(MessageDB.created_at).all()
-    
-    # Build messages for DeepSeek
-    messages = [{"role": "system", "content": character.system_prompt}]
-    for msg in history[-10:]:  # Last 10 messages
-        messages.append({"role": msg.role, "content": msg.content})
-    
-    # Call DeepSeek API
-    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
-    ai_response_text = None
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.deepseek.com/chat/completions",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {deepseek_key}"
-                },
-                json={
-                    "model": "deepseek-v4-flash",
-                    "messages": messages,
-                    "temperature": 0.8,
-                    "max_tokens": 300
-                }
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                ai_response_text = data["choices"][0]["message"]["content"]
-            else:
-                ai_response_text = f"Sorry, I'm distracted right now. Try again?"
-    except Exception as e:
-        print(f"DeepSeek error: {e}")
-        ai_response_text = f"Hmm, I had a moment there... say that again?"
-    
-    # Save AI response
-    ai_msg = MessageDB(chat_id=chat.id, role="assistant", content=ai_response_text)
-    db.add(ai_msg)
-    db.commit()
-    db.refresh(ai_msg)
-    
-    # Update daily counter and relationship level
-    current_user.daily_messages_used += 1
-    chat.relationship_level = min(100, chat.relationship_level + 2)
-    db.commit()
-    
-    remaining = max(0, 3 - current_user.daily_messages_used)
+    if "error" in result:
+        raise HTTPException(status_code=429, detail=result["error"])
     
     return {
-        "message": {
-            "id": user_msg.id,
-            "role": user_msg.role,
-            "content": user_msg.content,
-            "created_at": user_msg.created_at
-        },
-        "reply": {
-            "id": ai_msg.id,
-            "role": ai_msg.role,
-            "content": ai_msg.content,
-            "created_at": ai_msg.created_at
-        },
-        "remaining_today": remaining
+        "message": result["message"],
+        "reply": result["reply"],
+        "remaining_today": result["remaining_today"]
     }
+
+# ===== Telegram Webhook Routes =====
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+async def send_telegram_message(chat_id: int, text: str):
+    """Send message back to Telegram user"""
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"{TELEGRAM_API_URL}/sendMessage",
+            json={"chat_id": chat_id, "text": text}
+        )
+
+@app.post("/webhook/telegram")
+async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
+    """Handle incoming Telegram messages"""
+    try:
+        data = await request.json()
+        update = TelegramUpdate(**data)
+        
+        if not update.message:
+            return {"ok": True}
+        
+        msg = update.message
+        if not msg.from_user or not msg.text:
+            return {"ok": True}
+        
+        tg_id = msg.from_user.id
+        username = msg.from_user.username
+        first_name = msg.from_user.first_name
+        
+        logger.info(f"Telegram message from {tg_id} ({username}): {msg.text[:50]}")
+        
+        # Handle /start command
+        if msg.text.startswith("/start"):
+            welcome = "🧚‍♀️ Welcome to Luna AI!\n\nChoose a character to chat with:\n1. /veronika\n2. /karina\n3. /alina\n4. /katya"
+            await send_telegram_message(tg_id, welcome)
+            return {"ok": True}
+        
+        # Handle character selection commands
+        character_map = {
+            "/veronika": 1,
+            "/karina": 2,
+            "/alina": 3,
+            "/katya": 4
+        }
+        
+        if msg.text in character_map:
+            # Get character info
+            character_id = character_map[msg.text]
+            character = db.query(CharacterDB).filter(CharacterDB.id == character_id).first()
+            if character:
+                intro = f"👋 You're now chatting with {character.name}.\nSay anything!"
+                await send_telegram_message(tg_id, intro)
+            return {"ok": True}
+        
+        # Determine which character is active (default to first message's character or Veronika)
+        # For now, default to Veronika (character_id=1)
+        character_id = 1
+        
+        # Process message
+        result = await process_user_message(tg_id, character_id, msg.text, db)
+        
+        if "error" in result:
+            reply = f"⚠️ {result['error']}"
+        else:
+            reply = result["reply"]["content"]
+        
+        await send_telegram_message(tg_id, reply)
+        return {"ok": True}
+        
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return {"ok": True}  # Always return 200 to Telegram
+
+@app.post("/telegram/set-webhook")
+async def set_telegram_webhook(webhook_url: str):
+    """Set Telegram webhook URL (call this once to register)"""
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{TELEGRAM_API_URL}/setWebhook",
+            json={"url": webhook_url}
+        )
+        return response.json()
 
 if __name__ == "__main__":
     import uvicorn
