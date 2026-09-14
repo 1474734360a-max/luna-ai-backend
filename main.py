@@ -444,65 +444,70 @@ async def send_telegram_message(chat_id: int, text: str):
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
-    """Handle incoming Telegram messages"""
+    """Handle incoming Telegram messages (raw dict parsing - avoids pydantic 'from' alias issues)"""
     try:
         data = await request.json()
-        update = TelegramUpdate(**data)
-        
-        if not update.message:
+        msg = data.get("message") or {}
+        frm = msg.get("from") or {}
+        tg_id = frm.get("id")
+        text = msg.get("text")
+        username = frm.get("username")
+
+        if not tg_id or not text:
             return {"ok": True}
-        
-        msg = update.message
-        if not msg.from_user or not msg.text:
-            return {"ok": True}
-        
-        tg_id = msg.from_user.id
-        username = msg.from_user.username
-        first_name = msg.from_user.first_name
-        
-        logger.info(f"Telegram message from {tg_id} ({username}): {msg.text[:50]}")
-        
+
+        logger.info(f"Telegram message from {tg_id} ({username}): {text[:50]}")
+
+        # Auto-register user
+        user = db.query(UserDB).filter(UserDB.tg_id == tg_id).first()
+        if not user:
+            user = UserDB(tg_id=tg_id, username=username, first_name=frm.get("first_name"), language="zh")
+            db.add(user)
+            db.commit()
+
         # Handle /start command
-        if msg.text.startswith("/start"):
-            welcome = "🧚‍♀️ Welcome to Luna AI!\n\nChoose a character to chat with:\n1. /veronika\n2. /karina\n3. /alina\n4. /katya"
+        if text.startswith("/start"):
+            welcome = ("🧚‍♀️ Welcome to Luna AI!\n\n"
+                       "Choose a character to chat with:\n"
+                       "1. /veronika\n2. /karina\n3. /alina\n4. /katya\n\n"
+                       "Then just send any message and she will reply 💬")
             await send_telegram_message(tg_id, welcome)
             return {"ok": True}
-        
+
         # Handle character selection commands
-        character_map = {
-            "/veronika": 1,
-            "/karina": 2,
-            "/alina": 3,
-            "/katya": 4
-        }
-        
-        if msg.text in character_map:
-            # Get character info
-            character_id = character_map[msg.text]
+        character_map = {"/veronika": 1, "/karina": 2, "/alina": 3, "/katya": 4}
+
+        if text in character_map:
+            character_id = character_map[text]
             character = db.query(CharacterDB).filter(CharacterDB.id == character_id).first()
             if character:
-                intro = f"👋 You're now chatting with {character.name}.\nSay anything!"
-                await send_telegram_message(tg_id, intro)
+                # Remember the user's current character via a chat row (latest chat = active)
+                chat = db.query(ChatDB).filter(
+                    ChatDB.tg_id == tg_id, ChatDB.character_id == character_id).first()
+                if not chat:
+                    chat = ChatDB(tg_id=tg_id, character_id=character_id)
+                    db.add(chat)
+                    db.commit()
+                await send_telegram_message(tg_id, f"👋 You're now chatting with {character.name}.\nSay anything!")
             return {"ok": True}
-        
-        # Determine which character is active (default to first message's character or Veronika)
-        # For now, default to Veronika (character_id=1)
-        character_id = 1
-        
-        # Process message
-        result = await process_user_message(tg_id, character_id, msg.text, db)
-        
+
+        # Use the character the user last chatted with, default Veronika
+        last_chat = db.query(ChatDB).filter(ChatDB.tg_id == tg_id).order_by(ChatDB.created_at.desc()).first()
+        character_id = last_chat.character_id if last_chat else 1
+
+        result = await process_user_message(tg_id, character_id, text, db)
+
         if "error" in result:
             reply = f"⚠️ {result['error']}"
         else:
             reply = result["reply"]["content"]
-        
+
         await send_telegram_message(tg_id, reply)
         return {"ok": True}
-        
+
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        return {"ok": True}  # Always return 200 to Telegram
+        return {"ok": True}
 
 @app.post("/telegram/set-webhook")
 async def set_telegram_webhook(webhook_url: str):
