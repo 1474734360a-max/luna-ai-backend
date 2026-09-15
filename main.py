@@ -347,6 +347,10 @@ async def process_user_message(tg_id: int, character_id: int, content: str, db: 
     
     # Build messages for DeepSeek
     messages = [{"role": "system", "content": character.system_prompt}]
+    if user.voice_enabled:
+        messages.append({"role": "system", "content":
+            "(系统提示: 你刚说的话会被自动转成你的语音发送给用户，语音功能完全正常。"
+            "不要说'语音传不过去'之类的话，可以自然地用语气词和拟声，让文字适合朗读。)"})
     for msg in history[-10:]:  # Last 10 messages
         messages.append({"role": msg.role, "content": msg.content})
     
